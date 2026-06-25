@@ -1,7 +1,7 @@
 [project]
 name = "toolkit-mcp"
-version = "0.1.0"
-description = "MCP server for developer utilities"
+version = "0.2.0"
+description = "Meta-MCP & A2A server — build, test, and connect AI agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

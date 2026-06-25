@@ -1,79 +1,69 @@
 """
-toolkit-mcp — MCP server for developer utilities.
+toolkit-mcp — Meta-MCP & A2A server.
 
-A well-architected MCP server demonstrating clean patterns for:
-- Tool definition with typed schemas
-- Input validation and error handling
-- Extensible handler registration
-- Multiple transport modes (stdio / SSE)
+A well-architected MCP server that helps build, test, and manage
+MCP itself, plus Agent-to-Agent (A2A) capability registry.
 
-Tools:
-    validate_json    — Validate and format JSON strings
-    json_to_schema   — Infer JSON Schema from example data
-    base64           — Encode or decode base64
-    timestamp        — Convert unix timestamp to readable date
-    hash             — Hash a string (md5, sha256, sha512)
+Layers:
+  Framework    — ToolRegistry with auto schema inference
+  Meta-MCP     — Tools for MCP: validate, inspect, generate, format
+  A2A          — Agent capability registry & task delegation
 """
 
 from __future__ import annotations
 
-import base64 as _base64
 import hashlib
 import json
 import time
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Union
+from enum import Enum
+from typing import Any, Callable, Optional, Union
 
-# ─── MCP SDK ──────────────────────────────────────────────
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import Tool, TextContent
+    from mcp.types import Tool, TextContent, Resource, ResourceTemplate
     import mcp.server.models as models
 except ImportError:
-    raise ImportError(
-        "MCP SDK required. Install with: pip install 'mcp[cli]'"
-    )
+    raise ImportError("MCP SDK required: pip install 'mcp[cli]'")
+
 
 # ══════════════════════════════════════════════════════════
-#  FRAMEWORK — Reusable MCP server architecture
+#  FRAMEWORK — ToolRegistry
 # ══════════════════════════════════════════════════════════
 
 class ToolRegistry:
-    """A registry of MCP tools with typed schemas and handlers.
+    """Decorator-based tool registry with auto schema inference.
     
-    This is the core architectural pattern — separate tool definition
-    from implementation, with automatic schema generation.
+    Usage:
+        registry = ToolRegistry()
+        
+        @registry.tool("name", "description")
+        def my_tool(param1: str, param2: int = 42) -> dict: ...
     """
     
     def __init__(self):
         self._tools: dict[str, Tool] = {}
         self._handlers: dict[str, Callable] = {}
     
-    def tool(self, name: str, description: str = "") -> Callable:
-        """Decorator: register a function as an MCP tool.
-        
-        The function's type hints are used to generate the JSON Schema.
-        Supports: str, int, float, bool, list[str], dict, Optional types.
-        """
-        def decorator(func: Callable) -> Callable:
-            schema = self._infer_schema(func)
+    def tool(self, name: str, description: str = ""):
+        def decorator(func: Callable):
             self._tools[name] = Tool(
                 name=name,
-                description=description or func.__doc__ or "",
-                inputSchema=schema,
+                description=description or (func.__doc__ or "").strip(),
+                inputSchema=self._infer_schema(func),
             )
             self._handlers[name] = func
             return func
         return decorator
     
-    def list_tools(self) -> list[Tool]:
+    def list(self) -> list[Tool]:
         return list(self._tools.values())
     
-    async def call_tool(self, name: str, arguments: dict) -> list[TextContent]:
+    async def call(self, name: str, arguments: dict) -> list[TextContent]:
         if name not in self._handlers:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
-        
         try:
             result = self._handlers[name](**arguments)
             if isinstance(result, (dict, list)):
@@ -86,12 +76,9 @@ class ToolRegistry:
     
     @staticmethod
     def _infer_schema(func: Callable) -> dict:
-        """Infer JSON Schema from a function's type annotations."""
         import inspect
         sig = inspect.signature(func)
-        props = {}
-        required = []
-        
+        props, required = {}, []
         type_map = {
             str: {"type": "string"},
             int: {"type": "integer"},
@@ -100,164 +87,447 @@ class ToolRegistry:
             list: {"type": "array", "items": {}},
             dict: {"type": "object"},
         }
-        
-        for name, param in sig.parameters.items():
-            if name == "self":
+        for pname, param in sig.parameters.items():
+            if pname == "self":
                 continue
             hint = param.annotation if param.annotation != inspect.Parameter.empty else str
-            # Handle Optional / Union types
-            origin = getattr(hint, "__origin__", None)
-            if origin is type(Union) and type(None) in hint.__args__:
-                # Optional type
-                actual_type = [t for t in hint.__args__ if t is not type(None)][0]
-                schema_entry = type_map.get(actual_type, {"type": "string"}).copy()
-                schema_entry["type"] = [schema_entry["type"], "null"]
+            origin = getattr(hint, "__origin__", None) if hasattr(hint, "__origin__") else None
+            if origin is Union and type(None) in hint.__args__:
+                actual = [t for t in hint.__args__ if t is not type(None)][0]
+                entry = type_map.get(actual, {"type": "string"}).copy()
+                entry["type"] = [entry["type"], "null"]
             else:
-                schema_entry = type_map.get(hint, {"type": "string"}).copy()
-            
-            schema_entry["description"] = f"Parameter {name}"
-            
+                entry = type_map.get(hint, {"type": "string"}).copy()
+            entry["description"] = f"Parameter {pname}"
             if param.default == inspect.Parameter.empty:
-                required.append(name)
+                required.append(pname)
             else:
-                schema_entry["default"] = param.default
-            
-            props[name] = schema_entry
-        
-        return {
-            "type": "object",
-            "properties": props,
-            "required": required,
-        }
+                entry["default"] = (
+                    param.default if not isinstance(param.default, Enum)
+                    else param.default.value
+                )
+            props[pname] = entry
+        return {"type": "object", "properties": props, "required": required}
 
-
-# ══════════════════════════════════════════════════════════
-#  TOOLS — Developer utilities
-# ══════════════════════════════════════════════════════════
 
 registry = ToolRegistry()
 
+# ══════════════════════════════════════════════════════════
+#  META-MCP — Tools about MCP itself
+# ══════════════════════════════════════════════════════════
 
-@registry.tool("validate_json", "Validate and pretty-print a JSON string")
-def validate_json(json_string: str, indent: int = 2) -> dict:
-    """Parse and format a JSON string. Returns the parsed data or an error."""
+@registry.tool("mcp_validate_config",
+    "Validate an MCP server configuration (Claude Desktop / Cursor mcpServers JSON). "
+    "Checks for common errors: missing required fields, invalid transport, bad paths."
+)
+def mcp_validate_config(config_json: str) -> dict:
+    """Parse and validate an MCP server configuration block.
+    
+    Args:
+        config_json: JSON string of an mcpServers config (or a single server entry)
+    """
     try:
-        data = json.loads(json_string)
-        return {
-            "valid": True,
-            "data": data,
-            "formatted": json.dumps(data, ensure_ascii=False, indent=indent),
-        }
+        config = json.loads(config_json)
     except json.JSONDecodeError as e:
-        return {
-            "valid": False,
-            "error": str(e),
-            "position": e.pos,
-            "line": e.lineno,
-            "column": e.colno,
-        }
+        return {"valid": False, "errors": [f"Invalid JSON: {e}"]}
+    
+    issues = []
+    warnings = []
+    
+    # Handle both wrapped {mcpServers: {...}} and bare server objects
+    if isinstance(config, dict):
+        if "mcpServers" in config:
+            servers = config["mcpServers"]
+        else:
+            servers = config
+        
+        if isinstance(servers, dict):
+            for name, srv in servers.items():
+                if not isinstance(srv, dict):
+                    issues.append(f"'{name}': server entry must be an object")
+                    continue
+                if "command" not in srv and "url" not in srv:
+                    issues.append(f"'{name}': missing 'command' (stdio) or 'url' (HTTP)")
+                if "command" in srv and not isinstance(srv["command"], str):
+                    issues.append(f"'{name}': 'command' must be a string")
+                if "args" in srv and not isinstance(srv["args"], list):
+                    warnings.append(f"'{name}': 'args' should be a list")
+    
+    return {
+        "valid": len(issues) == 0,
+        "server_count": len(servers) if isinstance(servers, dict) else 0,
+        "issues": issues,
+        "warnings": warnings,
+    }
 
 
-@registry.tool("json_to_schema", "Infer a JSON Schema from example JSON data")
-def json_to_schema(json_string: str) -> dict:
-    """Analyze example JSON and generate a compatible JSON Schema draft-07."""
+@registry.tool("mcp_inspect_schema",
+    "Analyze a JSON Schema and describe what MCP tool it defines. "
+    "Shows parameter names, types, required fields, and generates example usage."
+)
+def mcp_inspect_schema(schema_json: str) -> dict:
+    """Inspect a JSON Schema and extract MCP-relevant information.
+    
+    Args:
+        schema_json: JSON Schema string (draft-07 or similar)
+    """
     try:
-        data = json.loads(json_string)
+        schema = json.loads(schema_json)
     except json.JSONDecodeError as e:
         return {"error": f"Invalid JSON: {e}"}
     
-    def infer_type(value: Any) -> dict:
-        if isinstance(value, bool):
-            return {"type": "boolean"}
-        elif isinstance(value, int):
-            return {"type": "integer"}
-        elif isinstance(value, float):
-            return {"type": "number"}
-        elif isinstance(value, str):
-            return {"type": "string"}
-        elif isinstance(value, list):
-            if value:
-                items = infer_type(value[0])
-                return {"type": "array", "items": items}
-            return {"type": "array"}
-        elif isinstance(value, dict):
-            props = {}
-            for k, v in value.items():
-                props[k] = infer_type(v)
-            return {"type": "object", "properties": props}
-        elif value is None:
-            return {"type": "null"}
-        return {"type": "string"}
+    props = schema.get("properties", {})
+    required = schema.get("required", [])
+    
+    params = []
+    for name, prop in props.items():
+        param = {
+            "name": name,
+            "type": prop.get("type", "unknown"),
+            "required": name in required,
+            "description": prop.get("description", ""),
+        }
+        if "default" in prop:
+            param["default"] = prop["default"]
+        if "enum" in prop:
+            param["enum"] = prop["enum"]
+        params.append(param)
+    
+    # Generate example call
+    example = {}
+    for p in params:
+        if p["required"]:
+            example[p["name"]] = _example_value(p["type"])
     
     return {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        **infer_type(data),
+        "type": schema.get("type", "object"),
+        "parameters": params,
+        "required_count": len(required),
+        "optional_count": len(props) - len(required),
+        "example_call": example,
     }
 
 
-@registry.tool("base64", "Encode or decode base64 strings")
-def base64_util(text: str, action: str = "encode") -> str:
-    """Encode text to base64 or decode base64 to text.
-    
-    Args:
-        text: The text to encode or decode
-        action: 'encode' or 'decode'
-    """
-    if action == "encode":
-        encoded = _base64.b64encode(text.encode()).decode()
-        return encoded
-    elif action == "decode":
-        try:
-            decoded = _base64.b64decode(text.encode()).decode()
-            return decoded
-        except Exception as e:
-            return f"Decode failed: {e}"
-    else:
-        return f"Invalid action: {action}. Use 'encode' or 'decode'."
+def _example_value(t: str) -> Any:
+    """Generate an example value for a type."""
+    mapping = {
+        "string": "example",
+        "integer": 0,
+        "number": 0.0,
+        "boolean": True,
+        "array": [],
+        "object": {},
+    }
+    return mapping.get(t, "example")
 
 
-@registry.tool("timestamp", "Convert a unix timestamp (seconds since epoch) to a human-readable date")
-def timestamp_util(seconds: float, utc: bool = False) -> dict:
-    """Convert seconds since epoch to a formatted datetime.
+@registry.tool("mcp_format_response",
+    "Format data as a proper MCP response structure. "
+    "Supports TextContent, and structured data responses."
+)
+def mcp_format_response(
+    data_json: str,
+    response_type: str = "text",
+    label: str = "",
+) -> dict:
+    """Wrap data into MCP response format.
     
     Args:
-        seconds: Unix timestamp in seconds
-        utc: If True, output UTC time. Otherwise local time.
+        data_json: The data to wrap
+        response_type: 'text' for TextContent
+        label: Optional label for the response
     """
-    tz = timezone.utc if utc else None
-    dt = datetime.fromtimestamp(seconds, tz=tz)
+    try:
+        data = json.loads(data_json)
+    except json.JSONDecodeError:
+        data = data_json
+    
     return {
-        "unix": seconds,
-        "iso": dt.isoformat(),
-        "formatted": dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "timezone": "UTC" if utc else "local",
+        "content": [
+            {
+                "type": response_type,
+                "text": json.dumps(data, ensure_ascii=False, indent=2)
+                if isinstance(data, (dict, list)) else str(data),
+            }
+        ],
+        "meta": {
+            "format": "mcp-response",
+            "label": label or "unlabeled",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
     }
-
-
-@registry.tool("hash", "Hash a string using common algorithms")
-def hash_util(text: str, algorithm: str = "sha256") -> str:
-    """Compute the hash of a string.
-    
-    Args:
-        text: The string to hash
-        algorithm: One of md5, sha1, sha256, sha512
-    """
-    algo_map = {
-        "md5": hashlib.md5,
-        "sha1": hashlib.sha1,
-        "sha256": hashlib.sha256,
-        "sha512": hashlib.sha512,
-    }
-    
-    if algorithm not in algo_map:
-        available = ", ".join(algo_map.keys())
-        return f"Unsupported algorithm: {algorithm}. Available: {available}"
-    
-    return algo_map[algorithm](text.encode()).hexdigest()
 
 
 # ══════════════════════════════════════════════════════════
-#  SERVER — MCP protocol server
+#  A2A — Agent-to-Agent capability registry & task delegation
+# ══════════════════════════════════════════════════════════
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    WORKING = "working"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+# In-memory A2A store (ephemeral — resets with server)
+_a2a_agents: dict[str, dict] = {}
+_a2a_tasks: dict[str, dict] = {}
+
+
+@registry.tool("a2a_register",
+    "Register an agent capability in the A2A registry. "
+    "Share what your agent can do so other agents can discover and delegate to you."
+)
+def a2a_register(
+    agent_name: str,
+    description: str,
+    capabilities: list[str],
+    contact_endpoint: str = "internal",
+) -> dict:
+    """Register or update an agent in the A2A capability registry.
+    
+    Args:
+        agent_name: Unique name for this agent
+        description: What this agent does
+        capabilities: List of capability strings, e.g. ['data_analysis', 'code_review']
+        contact_endpoint: How to reach this agent (URL or 'internal')
+    """
+    agent_id = agent_name.lower().replace(" ", "-")
+    _a2a_agents[agent_id] = {
+        "agent_id": agent_id,
+        "name": agent_name,
+        "description": description,
+        "capabilities": capabilities,
+        "contact_endpoint": contact_endpoint,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+    }
+    return {
+        "status": "registered",
+        "agent_id": agent_id,
+        "capability_count": len(capabilities),
+        "message": f"Agent '{agent_name}' registered with {len(capabilities)} capabilities",
+    }
+
+
+@registry.tool("a2a_discover",
+    "Discover agents by capability. Search the A2A registry for agents "
+    "that can perform specific tasks."
+)
+def a2a_discover(
+    capability: str = "",
+    keyword: str = "",
+) -> dict:
+    """Find agents matching a capability or keyword.
+    
+    Args:
+        capability: Filter by capability name (partial match)
+        keyword: Filter by keyword in name or description
+    """
+    results = []
+    for aid, agent in _a2a_agents.items():
+        score = 0
+        if capability:
+            for cap in agent["capabilities"]:
+                if capability.lower() in cap.lower():
+                    score += 1
+        if keyword:
+            if keyword.lower() in agent["name"].lower():
+                score += 1
+            if keyword.lower() in agent["description"].lower():
+                score += 1
+        
+        if score > 0 or (not capability and not keyword):
+            results.append({
+                "agent_id": agent["agent_id"],
+                "name": agent["name"],
+                "description": agent["description"],
+                "capabilities": agent["capabilities"],
+                "match_score": score,
+            })
+    
+    # Sort by match score
+    results.sort(key=lambda x: x["match_score"], reverse=True)
+    
+    return {
+        "total_agents": len(_a2a_agents),
+        "query": {"capability": capability, "keyword": keyword},
+        "results": results,
+        "result_count": len(results),
+    }
+
+
+@registry.tool("a2a_list_all",
+    "List all registered agents and their capabilities."
+)
+def a2a_list_all() -> dict:
+    """List every agent currently registered in the A2A registry."""
+    agents = []
+    for aid, agent in _a2a_agents.items():
+        agents.append({
+            "agent_id": agent["agent_id"],
+            "name": agent["name"],
+            "capabilities": agent["capabilities"],
+            "description": agent["description"][:80],
+        })
+    return {
+        "total_agents": len(agents),
+        "agents": agents,
+    }
+
+
+@registry.tool("a2a_submit_task",
+    "Submit a task to be processed by an agent (or for general processing). "
+    "Returns a task_id for status polling."
+)
+def a2a_submit_task(
+    task_type: str,
+    input_data_json: str,
+    target_agent: str = "any",
+) -> dict:
+    """Submit a new task to the A2A task system.
+    
+    Args:
+        task_type: Type/category of task, e.g. 'code_review', 'data_analysis'
+        input_data_json: JSON string with task input data
+        target_agent: Specific agent to handle this, or 'any' for auto-assign
+    """
+    task_id = str(uuid.uuid4())[:8]
+    
+    try:
+        input_data = json.loads(input_data_json)
+    except json.JSONDecodeError:
+        input_data = {"raw": input_data_json}
+    
+    task = {
+        "task_id": task_id,
+        "task_type": task_type,
+        "status": TaskStatus.PENDING.value,
+        "input": input_data,
+        "target_agent": target_agent,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "output": None,
+        "error": None,
+    }
+    _a2a_tasks[task_id] = task
+    
+    # Auto-process simple tasks immediately
+    _auto_process_task(task_id)
+    
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "message": f"Task {task_id} submitted",
+    }
+
+
+@registry.tool("a2a_get_task",
+    "Get the status and result of a previously submitted task."
+)
+def a2a_get_task(task_id: str) -> dict:
+    """Check task status and retrieve results.
+    
+    Args:
+        task_id: The task ID returned by a2a_submit_task
+    """
+    if task_id not in _a2a_tasks:
+        return {"error": f"Task {task_id} not found"}
+    
+    task = _a2a_tasks[task_id]
+    return {
+        "task_id": task["task_id"],
+        "task_type": task["task_type"],
+        "status": task["status"],
+        "created_at": task["created_at"],
+        "output": task.get("output"),
+        "error": task.get("error"),
+    }
+
+
+@registry.tool("a2a_list_tasks",
+    "List all tasks and their current status."
+)
+def a2a_list_tasks(status_filter: str = "") -> dict:
+    """List all tasks, optionally filtered by status.
+    
+    Args:
+        status_filter: Optional filter: 'pending', 'working', 'completed', 'failed'
+    """
+    tasks = []
+    for tid, task in _a2a_tasks.items():
+        if status_filter and task["status"] != status_filter:
+            continue
+        tasks.append({
+            "task_id": task["task_id"],
+            "task_type": task["task_type"],
+            "status": task["status"],
+            "created_at": task["created_at"],
+        })
+    
+    tasks.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    return {
+        "total": len(tasks),
+        "filter": status_filter or "all",
+        "tasks": tasks,
+    }
+
+
+def _auto_process_task(task_id: str):
+    """Auto-process simple tasks for demo purposes.
+    
+    In production, this would dispatch to real agent handlers.
+    """
+    task = _a2a_tasks.get(task_id)
+    if not task:
+        return
+    
+    task["status"] = TaskStatus.WORKING.value
+    
+    ttype = task["task_type"]
+    inp = task["input"]
+    
+    try:
+        if ttype == "echo":
+            output = {"echo": inp}
+        elif ttype == "analyze_json":
+            if isinstance(inp, dict):
+                output = {
+                    "keys": list(inp.keys()),
+                    "value_types": {k: type(v).__name__ for k, v in inp.items()},
+                    "depth": _depth(inp),
+                }
+            else:
+                output = {"note": "Input is not a JSON object", "type": type(inp).__name__}
+        elif ttype == "hash":
+            raw = json.dumps(inp) if isinstance(inp, dict) else str(inp)
+            output = {
+                "sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                "md5": hashlib.md5(raw.encode()).hexdigest(),
+                "length": len(raw),
+            }
+        else:
+            output = {
+                "note": f"Task type '{ttype}' processed",
+                "input_summary": str(inp)[:200],
+            }
+        
+        task["status"] = TaskStatus.COMPLETED.value
+        task["output"] = output
+    except Exception as e:
+        task["status"] = TaskStatus.FAILED.value
+        task["error"] = str(e)
+
+
+def _depth(obj: Any, max_d: int = 10) -> int:
+    """Compute nesting depth of a dict."""
+    if not isinstance(obj, dict) or max_d <= 0:
+        return 0
+    return 1 + max((_depth(v, max_d - 1) for v in obj.values()), default=0)
+
+
+# ══════════════════════════════════════════════════════════
+#  SERVER — MCP protocol binding
 # ══════════════════════════════════════════════════════════
 
 server = Server("toolkit-mcp")
@@ -265,39 +535,27 @@ server = Server("toolkit-mcp")
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return registry.list_tools()
+    return registry.list()
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    return await registry.call_tool(name, arguments)
+    return await registry.call(name, arguments)
 
-
-# ══════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════
 
 def main():
     import asyncio
     import argparse
     
-    parser = argparse.ArgumentParser(
-        description="toolkit-mcp: Developer utilities MCP server"
-    )
-    parser.add_argument(
-        "--transport", choices=["stdio", "sse"], default="stdio",
-        help="Transport protocol (default: stdio)",
-    )
-    parser.add_argument(
-        "--port", type=int, default=8080,
-        help="Port for SSE transport (default: 8080)",
-    )
+    parser = argparse.ArgumentParser(description="toolkit-mcp: Meta-MCP & A2A server")
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
+    parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     
-    print(f"Starting toolkit-mcp ({args.transport})...")
-    print(f"Tools loaded: {len(registry.list_tools())}")
-    for tool in registry.list_tools():
-        print(f"  - {tool.name}: {tool.description}")
+    print(f"toolkit-mcp ({args.transport})")
+    print(f"Tools: {len(registry.list())}")
+    for t in registry.list():
+        print(f"  {t.name:25s} {t.description[:55]}")
     
     if args.transport == "sse":
         _run_sse(args.port)
@@ -310,38 +568,24 @@ def _run_sse(port: int):
     from starlette.applications import Starlette
     from starlette.routing import Route
     import uvicorn
-    
     sse = SseServerTransport("/messages/")
-    
     async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send,
-        ) as streams:
-            await server.run(
-                streams[0], streams[1],
-                models.InitializationOptions(
-                    server_name="toolkit-mcp",
-                    server_version="0.1.0",
-                ),
-            )
-    
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await server.run(streams[0], streams[1], models.InitializationOptions(
+                server_name="toolkit-mcp", server_version="0.2.0",
+            ))
     app = Starlette(routes=[
         Route("/sse", endpoint=handle_sse),
         Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
     ])
-    
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 async def _run_stdio():
     async with stdio_server() as streams:
-        await server.run(
-            streams[0], streams[1],
-            models.InitializationOptions(
-                server_name="toolkit-mcp",
-                server_version="0.1.0",
-            ),
-        )
+        await server.run(streams[0], streams[1], models.InitializationOptions(
+            server_name="toolkit-mcp", server_version="0.2.0",
+        ))
 
 
 if __name__ == "__main__":
