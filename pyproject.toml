@@ -1,0 +1,17 @@
+[project]
+name = "ticker-mcp"
+version = "0.1.0"
+description = "MCP server for real-time stock quotes and market data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+ticker-mcp = "server:main"
+
+[dependencies]
+mcp = { extras = ["cli"], version = ">=1.0.0" }
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
