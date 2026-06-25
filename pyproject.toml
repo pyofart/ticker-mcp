@@ -1,13 +1,13 @@
 [project]
-name = "ticker-mcp"
+name = "toolkit-mcp"
 version = "0.1.0"
-description = "MCP server for real-time stock quotes and market data"
+description = "MCP server for developer utilities"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
 [project.scripts]
-ticker-mcp = "server:main"
+toolkit-mcp = "server:main"
 
 [dependencies]
 mcp = { extras = ["cli"], version = ">=1.0.0" }

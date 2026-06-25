@@ -1,30 +1,28 @@
 """
-ticker-mcp — MCP server for real-time stock market data.
+toolkit-mcp — MCP server for developer utilities.
 
-Provides real-time stock quotes and market data via the Model Context Protocol.
-No API key required. Data sourced from public financial data feeds.
-
-Usage:
-    # Install
-    pip install "mcp[cli]"
-    
-    # Run stdio mode (for Claude Desktop / Cursor)
-    python server.py
-    
-    # Run HTTP mode
-    python server.py --transport sse --port 8080
+A well-architected MCP server demonstrating clean patterns for:
+- Tool definition with typed schemas
+- Input validation and error handling
+- Extensible handler registration
+- Multiple transport modes (stdio / SSE)
 
 Tools:
-    - get_quote:       Real-time quote for one or more stocks
-    - get_market_summary: Major market indices overview
-    - get_sector_data:  Sector performance overview
+    validate_json    — Validate and format JSON strings
+    json_to_schema   — Infer JSON Schema from example data
+    base64           — Encode or decode base64
+    timestamp        — Convert unix timestamp to readable date
+    hash             — Hash a string (md5, sha256, sha512)
 """
 
-from typing import Any
-import urllib.request
-import urllib.parse
+from __future__ import annotations
+
+import base64 as _base64
+import hashlib
 import json
-import codecs
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Union
 
 # ─── MCP SDK ──────────────────────────────────────────────
 try:
@@ -38,170 +36,241 @@ except ImportError:
     )
 
 # ══════════════════════════════════════════════════════════
-#  DATA LAYER — Public financial data API
+#  FRAMEWORK — Reusable MCP server architecture
 # ══════════════════════════════════════════════════════════
 
-API_BASE = "https://qt.gtimg.cn"
-
-# Known market indices codes
-INDICES = {
-    "sh000001": "Shanghai Composite",
-    "sz399001": "Shenzhen Component",
-    "sz399006": "ChiNext",
-    "sh000688": "STAR 50",
-    "sh000300": "CSI 300",
-    "sh000016": "SSE 50",
-    "sh000905": "CSI 500",
-}
-
-
-def _normalize_code(code: str) -> str:
-    """Normalize a stock code to the API format.
+class ToolRegistry:
+    """A registry of MCP tools with typed schemas and handlers.
     
-    - 6-digit codes starting with 6 → Shanghai (sh)
-    - Other 6-digit codes → Shenzhen (sz)
-    - Already prefixed codes → keep as-is
+    This is the core architectural pattern — separate tool definition
+    from implementation, with automatic schema generation.
     """
-    code = code.strip().upper()
-    if code.startswith(("SH", "SZ")):
-        return code.lower()
-    if len(code) == 6:
-        prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
-        return f"{prefix}{code}"
-    return code
-
-
-def _fetch_quote_raw(codes: list[str]) -> dict[str, list[str]]:
-    """Fetch raw quote data from the public API.
     
-    Returns a dict mapping code → list of fields.
-    """
-    normalized = [_normalize_code(c) for c in codes]
-    query = ",".join(normalized)
-    url = f"{API_BASE}/q={query}"
+    def __init__(self):
+        self._tools: dict[str, Tool] = {}
+        self._handlers: dict[str, Callable] = {}
     
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read()
+    def tool(self, name: str, description: str = "") -> Callable:
+        """Decorator: register a function as an MCP tool.
+        
+        The function's type hints are used to generate the JSON Schema.
+        Supports: str, int, float, bool, list[str], dict, Optional types.
+        """
+        def decorator(func: Callable) -> Callable:
+            schema = self._infer_schema(func)
+            self._tools[name] = Tool(
+                name=name,
+                description=description or func.__doc__ or "",
+                inputSchema=schema,
+            )
+            self._handlers[name] = func
+            return func
+        return decorator
     
-    # The API returns GBK-encoded text
-    text = codecs.decode(raw, "gbk")
+    def list_tools(self) -> list[Tool]:
+        return list(self._tools.values())
     
-    result: dict[str, list[str]] = {}
-    for line in text.strip().split("\n"):
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"')
-        parts = value.split("~")
-        result[key] = parts
+    async def call_tool(self, name: str, arguments: dict) -> list[TextContent]:
+        if name not in self._handlers:
+            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        
+        try:
+            result = self._handlers[name](**arguments)
+            if isinstance(result, (dict, list)):
+                text = json.dumps(result, ensure_ascii=False, indent=2)
+            else:
+                text = str(result)
+            return [TextContent(type="text", text=text)]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
     
-    return result
-
-
-def _parse_quote(parts: list[str], code: str) -> dict[str, Any]:
-    """Parse the raw API response into a structured quote."""
-    if len(parts) < 48:
-        return {"code": code, "error": "Incomplete data"}
-    
-    try:
-        return {
-            "code": code,
-            "name": parts[1],
-            "price": float(parts[3]),
-            "previous_close": float(parts[4]),
-            "open": float(parts[5]),
-            "volume": int(parts[6]) if parts[6] else 0,
-            "high": float(parts[33]),
-            "low": float(parts[34]),
-            "change": float(parts[31]),
-            "change_pct": float(parts[32]),
-            "turnover_rate": float(parts[38]) if parts[38] else 0.0,
-            "pe_ratio": float(parts[39]) if parts[39] else 0.0,
-            "amplitude": float(parts[43]) if parts[43] else 0.0,
-            "circulating_market_cap": float(parts[44]) if parts[44] else 0.0,
-            "total_market_cap": float(parts[45]) if parts[45] else 0.0,
-            "pb_ratio": float(parts[46]) if parts[46] else 0.0,
+    @staticmethod
+    def _infer_schema(func: Callable) -> dict:
+        """Infer JSON Schema from a function's type annotations."""
+        import inspect
+        sig = inspect.signature(func)
+        props = {}
+        required = []
+        
+        type_map = {
+            str: {"type": "string"},
+            int: {"type": "integer"},
+            float: {"type": "number"},
+            bool: {"type": "boolean"},
+            list: {"type": "array", "items": {}},
+            dict: {"type": "object"},
         }
-    except (ValueError, IndexError):
-        return {"code": code, "error": "Parse error"}
+        
+        for name, param in sig.parameters.items():
+            if name == "self":
+                continue
+            hint = param.annotation if param.annotation != inspect.Parameter.empty else str
+            # Handle Optional / Union types
+            origin = getattr(hint, "__origin__", None)
+            if origin is type(Union) and type(None) in hint.__args__:
+                # Optional type
+                actual_type = [t for t in hint.__args__ if t is not type(None)][0]
+                schema_entry = type_map.get(actual_type, {"type": "string"}).copy()
+                schema_entry["type"] = [schema_entry["type"], "null"]
+            else:
+                schema_entry = type_map.get(hint, {"type": "string"}).copy()
+            
+            schema_entry["description"] = f"Parameter {name}"
+            
+            if param.default == inspect.Parameter.empty:
+                required.append(name)
+            else:
+                schema_entry["default"] = param.default
+            
+            props[name] = schema_entry
+        
+        return {
+            "type": "object",
+            "properties": props,
+            "required": required,
+        }
 
 
 # ══════════════════════════════════════════════════════════
-#  MCP SERVER
+#  TOOLS — Developer utilities
 # ══════════════════════════════════════════════════════════
 
-server = Server("ticker-mcp")
+registry = ToolRegistry()
+
+
+@registry.tool("validate_json", "Validate and pretty-print a JSON string")
+def validate_json(json_string: str, indent: int = 2) -> dict:
+    """Parse and format a JSON string. Returns the parsed data or an error."""
+    try:
+        data = json.loads(json_string)
+        return {
+            "valid": True,
+            "data": data,
+            "formatted": json.dumps(data, ensure_ascii=False, indent=indent),
+        }
+    except json.JSONDecodeError as e:
+        return {
+            "valid": False,
+            "error": str(e),
+            "position": e.pos,
+            "line": e.lineno,
+            "column": e.colno,
+        }
+
+
+@registry.tool("json_to_schema", "Infer a JSON Schema from example JSON data")
+def json_to_schema(json_string: str) -> dict:
+    """Analyze example JSON and generate a compatible JSON Schema draft-07."""
+    try:
+        data = json.loads(json_string)
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
+    
+    def infer_type(value: Any) -> dict:
+        if isinstance(value, bool):
+            return {"type": "boolean"}
+        elif isinstance(value, int):
+            return {"type": "integer"}
+        elif isinstance(value, float):
+            return {"type": "number"}
+        elif isinstance(value, str):
+            return {"type": "string"}
+        elif isinstance(value, list):
+            if value:
+                items = infer_type(value[0])
+                return {"type": "array", "items": items}
+            return {"type": "array"}
+        elif isinstance(value, dict):
+            props = {}
+            for k, v in value.items():
+                props[k] = infer_type(v)
+            return {"type": "object", "properties": props}
+        elif value is None:
+            return {"type": "null"}
+        return {"type": "string"}
+    
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        **infer_type(data),
+    }
+
+
+@registry.tool("base64", "Encode or decode base64 strings")
+def base64_util(text: str, action: str = "encode") -> str:
+    """Encode text to base64 or decode base64 to text.
+    
+    Args:
+        text: The text to encode or decode
+        action: 'encode' or 'decode'
+    """
+    if action == "encode":
+        encoded = _base64.b64encode(text.encode()).decode()
+        return encoded
+    elif action == "decode":
+        try:
+            decoded = _base64.b64decode(text.encode()).decode()
+            return decoded
+        except Exception as e:
+            return f"Decode failed: {e}"
+    else:
+        return f"Invalid action: {action}. Use 'encode' or 'decode'."
+
+
+@registry.tool("timestamp", "Convert a unix timestamp (seconds since epoch) to a human-readable date")
+def timestamp_util(seconds: float, utc: bool = False) -> dict:
+    """Convert seconds since epoch to a formatted datetime.
+    
+    Args:
+        seconds: Unix timestamp in seconds
+        utc: If True, output UTC time. Otherwise local time.
+    """
+    tz = timezone.utc if utc else None
+    dt = datetime.fromtimestamp(seconds, tz=tz)
+    return {
+        "unix": seconds,
+        "iso": dt.isoformat(),
+        "formatted": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "timezone": "UTC" if utc else "local",
+    }
+
+
+@registry.tool("hash", "Hash a string using common algorithms")
+def hash_util(text: str, algorithm: str = "sha256") -> str:
+    """Compute the hash of a string.
+    
+    Args:
+        text: The string to hash
+        algorithm: One of md5, sha1, sha256, sha512
+    """
+    algo_map = {
+        "md5": hashlib.md5,
+        "sha1": hashlib.sha1,
+        "sha256": hashlib.sha256,
+        "sha512": hashlib.sha512,
+    }
+    
+    if algorithm not in algo_map:
+        available = ", ".join(algo_map.keys())
+        return f"Unsupported algorithm: {algorithm}. Available: {available}"
+    
+    return algo_map[algorithm](text.encode()).hexdigest()
+
+
+# ══════════════════════════════════════════════════════════
+#  SERVER — MCP protocol server
+# ══════════════════════════════════════════════════════════
+
+server = Server("toolkit-mcp")
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="get_quote",
-            description="Get real-time stock quotes by ticker code(s). "
-                        "Supports Chinese A-share stocks (e.g., 600519, 000002). "
-                        "No API key required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "codes": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Stock code(s), e.g. ['600519', '000002']",
-                    }
-                },
-                "required": ["codes"],
-            },
-        ),
-        Tool(
-            name="get_market_summary",
-            description="Get overview of major Chinese market indices "
-                        "(Shanghai Composite, Shenzhen Component, CSI 300, etc.)",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
-    ]
+    return registry.list_tools()
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    if name == "get_quote":
-        codes = arguments.get("codes", [])
-        if not codes:
-            return [TextContent(type="text", text="Please provide at least one stock code.")]
-        
-        raw = _fetch_quote_raw(codes)
-        results = []
-        for code, parts in raw.items():
-            results.append(_parse_quote(parts, code))
-        
-        return [TextContent(
-            type="text",
-            text=json.dumps(results, ensure_ascii=False, indent=2),
-        )]
-    
-    elif name == "get_market_summary":
-        codes = list(INDICES.keys())
-        raw = _fetch_quote_raw(codes)
-        
-        results = []
-        for code, parts in raw.items():
-            name = INDICES.get(code, code)
-            quote = _parse_quote(parts, code)
-            quote["index_name"] = name
-            results.append(quote)
-        
-        return [TextContent(
-            type="text",
-            text=json.dumps(results, ensure_ascii=False, indent=2),
-        )]
-    
-    else:
-        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    return await registry.call_tool(name, arguments)
 
 
 # ══════════════════════════════════════════════════════════
@@ -212,39 +281,56 @@ def main():
     import asyncio
     import argparse
     
-    parser = argparse.ArgumentParser(description="ticker-mcp: Stock data MCP server")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
-                       help="Transport protocol (default: stdio)")
-    parser.add_argument("--port", type=int, default=8080,
-                       help="Port for SSE transport (default: 8080)")
+    parser = argparse.ArgumentParser(
+        description="toolkit-mcp: Developer utilities MCP server"
+    )
+    parser.add_argument(
+        "--transport", choices=["stdio", "sse"], default="stdio",
+        help="Transport protocol (default: stdio)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8080,
+        help="Port for SSE transport (default: 8080)",
+    )
     args = parser.parse_args()
     
+    print(f"Starting toolkit-mcp ({args.transport})...")
+    print(f"Tools loaded: {len(registry.list_tools())}")
+    for tool in registry.list_tools():
+        print(f"  - {tool.name}: {tool.description}")
+    
     if args.transport == "sse":
-        from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
-        from starlette.routing import Route
-        import uvicorn
-        
-        sse = SseServerTransport("/messages/")
-        
-        async def handle_sse(request):
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send,
-            ) as streams:
-                await server.run(streams[0], streams[1], models.InitializationOptions(
-                    server_name="ticker-mcp",
-                    server_version="0.1.0",
-                ))
-        
-        app = Starlette(routes=[
-            Route("/sse", endpoint=handle_sse),
-            Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
-        ])
-        
-        print(f"Starting ticker-mcp SSE server on port {args.port}...")
-        uvicorn.run(app, host="0.0.0.0", port=args.port)
+        _run_sse(args.port)
     else:
         asyncio.run(_run_stdio())
+
+
+def _run_sse(port: int):
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    import uvicorn
+    
+    sse = SseServerTransport("/messages/")
+    
+    async def handle_sse(request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send,
+        ) as streams:
+            await server.run(
+                streams[0], streams[1],
+                models.InitializationOptions(
+                    server_name="toolkit-mcp",
+                    server_version="0.1.0",
+                ),
+            )
+    
+    app = Starlette(routes=[
+        Route("/sse", endpoint=handle_sse),
+        Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
+    ])
+    
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 async def _run_stdio():
@@ -252,7 +338,7 @@ async def _run_stdio():
         await server.run(
             streams[0], streams[1],
             models.InitializationOptions(
-                server_name="ticker-mcp",
+                server_name="toolkit-mcp",
                 server_version="0.1.0",
             ),
         )

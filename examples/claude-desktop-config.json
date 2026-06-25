@@ -1,11 +1,8 @@
 {
   "mcpServers": {
-    "ticker": {
+    "toolkit": {
       "command": "python",
-      "args": [
-        "/path/to/server.py"
-      ],
-      "env": {}
+      "args": ["/path/to/server.py"]
     }
   }
 }
