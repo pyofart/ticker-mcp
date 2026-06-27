@@ -14,16 +14,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
+import os
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Union
 
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import Tool, TextContent, Resource, ResourceTemplate
+    from mcp.types import Tool, TextContent
     import mcp.server.models as models
 except ImportError:
     raise ImportError("MCP SDK required: pip install 'mcp[cli]'")
@@ -269,9 +269,59 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
-# In-memory A2A store (ephemeral — resets with server)
-_a2a_agents: dict[str, dict] = {}
-_a2a_tasks: dict[str, dict] = {}
+# File-backed A2A store (persists across restarts)
+
+_A2A_DATA_FILE = os.environ.get(
+    "_A2A_DATA_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "a2a_data.json"),
+)
+
+
+class _FileStore:
+    """Simple JSON file-backed key-value store."""
+    
+    def __init__(self, path: str):
+        self._path = path
+        self._data: dict = {}
+        self._load()
+    
+    def _load(self):
+        if os.path.isfile(self._path):
+            try:
+                with open(self._path, "r") as f:
+                    self._data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self._data = {}
+        else:
+            self._data = {"agents": {}, "tasks": {}}
+        self._data.setdefault("agents", {})
+        self._data.setdefault("tasks", {})
+    
+    def _save(self):
+        try:
+            with open(self._path, "w") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+        except IOError:
+            pass  # Silently fail on write errors
+    
+    @property
+    def agents(self) -> dict:
+        return self._data["agents"]
+    
+    @property
+    def tasks(self) -> dict:
+        return self._data["tasks"]
+    
+    def set_agent(self, agent_id: str, data: dict):
+        self._data["agents"][agent_id] = data
+        self._save()
+    
+    def set_task(self, task_id: str, data: dict):
+        self._data["tasks"][task_id] = data
+        self._save()
+
+
+_a2a_store = _FileStore(_A2A_DATA_FILE)
 
 
 @registry.tool("a2a_register",
@@ -293,7 +343,7 @@ def a2a_register(
         contact_endpoint: How to reach this agent (URL or 'internal')
     """
     agent_id = agent_name.lower().replace(" ", "-")
-    _a2a_agents[agent_id] = {
+    _a2a_store.set_agent(agent_id, {
         "agent_id": agent_id,
         "name": agent_name,
         "description": description,
@@ -301,7 +351,7 @@ def a2a_register(
         "contact_endpoint": contact_endpoint,
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "last_seen": datetime.now(timezone.utc).isoformat(),
-    }
+    })
     return {
         "status": "registered",
         "agent_id": agent_id,
@@ -325,7 +375,7 @@ def a2a_discover(
         keyword: Filter by keyword in name or description
     """
     results = []
-    for aid, agent in _a2a_agents.items():
+    for aid, agent in _a2a_store.agents.items():
         score = 0
         if capability:
             for cap in agent["capabilities"]:
@@ -350,7 +400,7 @@ def a2a_discover(
     results.sort(key=lambda x: x["match_score"], reverse=True)
     
     return {
-        "total_agents": len(_a2a_agents),
+        "total_agents": len(_a2a_store.agents),
         "query": {"capability": capability, "keyword": keyword},
         "results": results,
         "result_count": len(results),
@@ -363,7 +413,7 @@ def a2a_discover(
 def a2a_list_all() -> dict:
     """List every agent currently registered in the A2A registry."""
     agents = []
-    for aid, agent in _a2a_agents.items():
+    for aid, agent in _a2a_store.agents.items():
         agents.append({
             "agent_id": agent["agent_id"],
             "name": agent["name"],
@@ -409,7 +459,7 @@ def a2a_submit_task(
         "output": None,
         "error": None,
     }
-    _a2a_tasks[task_id] = task
+    _a2a_store.set_task(task_id, task)
     
     # Auto-process simple tasks immediately
     _auto_process_task(task_id)
@@ -430,10 +480,10 @@ def a2a_get_task(task_id: str) -> dict:
     Args:
         task_id: The task ID returned by a2a_submit_task
     """
-    if task_id not in _a2a_tasks:
+    if task_id not in _a2a_store.tasks:
         return {"error": f"Task {task_id} not found"}
     
-    task = _a2a_tasks[task_id]
+    task = _a2a_store.tasks[task_id]
     return {
         "task_id": task["task_id"],
         "task_type": task["task_type"],
@@ -454,7 +504,7 @@ def a2a_list_tasks(status_filter: str = "") -> dict:
         status_filter: Optional filter: 'pending', 'working', 'completed', 'failed'
     """
     tasks = []
-    for tid, task in _a2a_tasks.items():
+    for tid, task in _a2a_store.tasks.items():
         if status_filter and task["status"] != status_filter:
             continue
         tasks.append({
@@ -478,7 +528,7 @@ def _auto_process_task(task_id: str):
     
     In production, this would dispatch to real agent handlers.
     """
-    task = _a2a_tasks.get(task_id)
+    task = _a2a_store.tasks.get(task_id)
     if not task:
         return
     

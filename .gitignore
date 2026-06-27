@@ -4,3 +4,6 @@ __pycache__/
 .venv
 dist/
 *.egg-info/
+a2a_data.json
+.test_a2a_data.json
+.pytest_cache/
