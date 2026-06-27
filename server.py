@@ -1,5 +1,5 @@
 """
-toolkit-mcp — Meta-MCP & A2A server.
+ticker-mcp — Meta-MCP & A2A server.
 
 A well-architected MCP server that helps build, test, and manage
 MCP itself, plus Agent-to-Agent (A2A) capability registry.
@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -28,6 +30,7 @@ try:
 except ImportError:
     raise ImportError("MCP SDK required: pip install 'mcp[cli]'")
 
+logger = logging.getLogger("ticker-mcp")
 
 # ══════════════════════════════════════════════════════════
 #  FRAMEWORK — ToolRegistry
@@ -134,7 +137,6 @@ def mcp_validate_config(config_json: str) -> dict:
     issues = []
     warnings = []
     
-    # Handle both wrapped {mcpServers: {...}} and bare server objects
     if isinstance(config, dict):
         if "mcpServers" in config:
             servers = config["mcpServers"]
@@ -193,7 +195,6 @@ def mcp_inspect_schema(schema_json: str) -> dict:
             param["enum"] = prop["enum"]
         params.append(param)
     
-    # Generate example call
     example = {}
     for p in params:
         if p["required"]:
@@ -209,7 +210,6 @@ def mcp_inspect_schema(schema_json: str) -> dict:
 
 
 def _example_value(t: str) -> Any:
-    """Generate an example value for a type."""
     mapping = {
         "string": "example",
         "integer": 0,
@@ -278,10 +278,11 @@ _A2A_DATA_FILE = os.environ.get(
 
 
 class _FileStore:
-    """Simple JSON file-backed key-value store."""
+    """Thread-safe JSON file-backed key-value store with atomic writes."""
     
     def __init__(self, path: str):
         self._path = path
+        self._lock = threading.Lock()
         self._data: dict = {}
         self._load()
     
@@ -290,7 +291,8 @@ class _FileStore:
             try:
                 with open(self._path, "r") as f:
                     self._data = json.load(f)
-            except (json.JSONDecodeError, IOError):
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning("Failed to load A2A data file, starting fresh: %s", e)
                 self._data = {}
         else:
             self._data = {"agents": {}, "tasks": {}}
@@ -298,11 +300,15 @@ class _FileStore:
         self._data.setdefault("tasks", {})
     
     def _save(self):
+        """Atomic write: write to temp file, then rename into place."""
+        tmp_path = self._path + ".tmp"
         try:
-            with open(self._path, "w") as f:
+            with open(tmp_path, "w") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
-        except IOError:
-            pass  # Silently fail on write errors
+            os.replace(tmp_path, self._path)
+        except (IOError, OSError) as e:
+            logger.error("A2A data persistence failed: %s", e)
+            raise RuntimeError("Data persistence failed") from e
     
     @property
     def agents(self) -> dict:
@@ -313,12 +319,14 @@ class _FileStore:
         return self._data["tasks"]
     
     def set_agent(self, agent_id: str, data: dict):
-        self._data["agents"][agent_id] = data
-        self._save()
+        with self._lock:
+            self._data["agents"][agent_id] = data
+            self._save()
     
     def set_task(self, task_id: str, data: dict):
-        self._data["tasks"][task_id] = data
-        self._save()
+        with self._lock:
+            self._data["tasks"][task_id] = data
+            self._save()
 
 
 _a2a_store = _FileStore(_A2A_DATA_FILE)
@@ -342,6 +350,18 @@ def a2a_register(
         capabilities: List of capability strings, e.g. ['data_analysis', 'code_review']
         contact_endpoint: How to reach this agent (URL or 'internal')
     """
+    # Input validation
+    if not agent_name or not isinstance(agent_name, str):
+        raise ValueError("agent_name must be a non-empty string")
+    if not isinstance(description, str):
+        raise ValueError("description must be a string")
+    if not capabilities or not isinstance(capabilities, list):
+        raise ValueError("capabilities must be a non-empty list")
+    if not all(isinstance(c, str) for c in capabilities):
+        raise ValueError("each capability must be a string")
+    if not isinstance(contact_endpoint, str):
+        raise ValueError("contact_endpoint must be a string")
+    
     agent_id = agent_name.lower().replace(" ", "-")
     _a2a_store.set_agent(agent_id, {
         "agent_id": agent_id,
@@ -396,7 +416,6 @@ def a2a_discover(
                 "match_score": score,
             })
     
-    # Sort by match score
     results.sort(key=lambda x: x["match_score"], reverse=True)
     
     return {
@@ -461,7 +480,6 @@ def a2a_submit_task(
     }
     _a2a_store.set_task(task_id, task)
     
-    # Auto-process simple tasks immediately
     _auto_process_task(task_id)
     
     return {
@@ -553,7 +571,6 @@ def _auto_process_task(task_id: str):
             raw = json.dumps(inp) if isinstance(inp, dict) else str(inp)
             output = {
                 "sha256": hashlib.sha256(raw.encode()).hexdigest(),
-                "md5": hashlib.md5(raw.encode()).hexdigest(),
                 "length": len(raw),
             }
         else:
@@ -580,7 +597,7 @@ def _depth(obj: Any, max_d: int = 10) -> int:
 #  SERVER — MCP protocol binding
 # ══════════════════════════════════════════════════════════
 
-server = Server("toolkit-mcp")
+server = Server("ticker-mcp")
 
 
 @server.list_tools()
@@ -593,50 +610,116 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     return await registry.call(name, arguments)
 
 
+# ══════════════════════════════════════════════════════════
+#  SSE TRANSPORT — with auth middleware
+# ══════════════════════════════════════════════════════════
+
+def _make_sse_app(token: str):
+    """Create Starlette app with optional token auth middleware."""
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+    from starlette.requests import Request
+    from starlette.routing import Route
+    
+    sse = SseServerTransport("/messages/")
+    
+    async def handle_sse(request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send,
+        ) as streams:
+            await server.run(
+                streams[0], streams[1],
+                models.InitializationOptions(
+                    server_name="ticker-mcp",
+                    server_version="0.3.0",
+                ),
+            )
+    
+    if token:
+        class AuthMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                auth = request.headers.get("Authorization", "")
+                query_token = request.query_params.get("token", "")
+                expected = f"Bearer {token}"
+                if auth == expected or query_token == token:
+                    return await call_next(request)
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                )
+        
+        app = Starlette(routes=[
+            Route("/sse", endpoint=handle_sse),
+            Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
+        ])
+        app.add_middleware(AuthMiddleware)
+    else:
+        app = Starlette(routes=[
+            Route("/sse", endpoint=handle_sse),
+            Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
+        ])
+    
+    return app
+
+
 def main():
     import asyncio
     import argparse
     
-    parser = argparse.ArgumentParser(description="toolkit-mcp: Meta-MCP & A2A server")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
-    parser.add_argument("--port", type=int, default=8080)
+    token = os.environ.get("TICKER_MCP_TOKEN", "")
+    
+    parser = argparse.ArgumentParser(description="ticker-mcp: Meta-MCP & A2A server")
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
+                       help="Transport protocol (default: stdio)")
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                       help="Bind address for SSE (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8080,
+                       help="Port for SSE transport (default: 8080)")
+    parser.add_argument("--token", type=str, default=token,
+                       help="Auth token for SSE (env: TICKER_MCP_TOKEN)")
     args = parser.parse_args()
     
-    print(f"toolkit-mcp ({args.transport})")
+    print(f"ticker-mcp ({args.transport})")
     print(f"Tools: {len(registry.list())}")
     for t in registry.list():
         print(f"  {t.name:25s} {t.description[:55]}")
     
     if args.transport == "sse":
-        _run_sse(args.port)
+        # Security warning when binding to all interfaces without auth
+        if args.host == "0.0.0.0" and not args.token:
+            print("\n" + "!" * 60)
+            print("  SECURITY WARNING: Server bound to 0.0.0.0 without auth token.")
+            print("  Anyone on the network can access this MCP server.")
+            print("  Set --token <key> or TICKER_MCP_TOKEN environment variable.")
+            print("!" * 60 + "\n")
+        elif args.host != "127.0.0.1" and not args.token:
+            print(f"\n  ⚠️  Bound to {args.host} without auth token. Use --token for security.\n")
+        
+        _run_sse(args.host, args.port, args.token)
     else:
         asyncio.run(_run_stdio())
 
 
-def _run_sse(port: int):
-    from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.routing import Route
+def _run_sse(host: str, port: int, token: str):
     import uvicorn
-    sse = SseServerTransport("/messages/")
-    async def handle_sse(request):
-        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-            await server.run(streams[0], streams[1], models.InitializationOptions(
-                server_name="toolkit-mcp", server_version="0.2.0",
-            ))
-    app = Starlette(routes=[
-        Route("/sse", endpoint=handle_sse),
-        Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
-    ])
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    app = _make_sse_app(token)
+    print(f"Listening on http://{host}:{port}/sse")
+    uvicorn.run(app, host=host, port=port)
 
 
 async def _run_stdio():
     async with stdio_server() as streams:
-        await server.run(streams[0], streams[1], models.InitializationOptions(
-            server_name="toolkit-mcp", server_version="0.2.0",
-        ))
+        await server.run(
+            streams[0], streams[1],
+            models.InitializationOptions(
+                server_name="ticker-mcp",
+                server_version="0.3.0",
+            ),
+        )
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     main()

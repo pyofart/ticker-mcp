@@ -3,9 +3,6 @@
 import json
 import os
 import sys
-import tempfile
-
-import tempfile
 
 # Point to the server module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -94,6 +91,42 @@ def test_a2a_register():
     assert result["agent_id"] == "testbot"
 
 
+def test_a2a_register_empty_name():
+    """Should reject empty agent name."""
+    try:
+        server.a2a_register("", "desc", ["test"])
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "agent_name" in str(e)
+
+
+def test_a2a_register_non_string_name():
+    """Should reject non-string agent name."""
+    try:
+        server.a2a_register(123, "desc", ["test"])
+        assert False, "Should have raised ValueError"
+    except ValueError:
+        pass
+
+
+def test_a2a_register_empty_capabilities():
+    """Should reject empty capabilities list."""
+    try:
+        server.a2a_register("Bot", "desc", [])
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "capabilities" in str(e)
+
+
+def test_a2a_register_invalid_capabilities():
+    """Should reject non-list capabilities."""
+    try:
+        server.a2a_register("Bot", "desc", "not-a-list")
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "capabilities" in str(e)
+
+
 def test_a2a_discover_by_capability():
     server.a2a_register("DiscoverBot", "Discovery test", ["search", "index"])
     result = server.a2a_discover(capability="search")
@@ -143,6 +176,41 @@ def test_a2a_list_tasks_filtered():
     assert "tasks" in result
 
 
+# ─── Hash task (MD5 removed) ─────────────────────────────
+
+def test_hash_task_no_md5():
+    """Hash task should only return SHA256, not MD5."""
+    result = server.a2a_submit_task(
+        task_type="hash",
+        input_data_json='"hello"',
+    )
+    task_id = result["task_id"]
+    task = server.a2a_get_task(task_id)
+    output = task.get("output", {})
+    assert "sha256" in output
+    assert "md5" not in output, "MD5 should not be present"
+    assert "length" in output
+
+
+# ─── _FileStore atomic write ─────────────────────────────
+
+def test_filestore_atomic_save(tmp_path):
+    """_FileStore should survive a partial write via atomic tmp file."""
+    data_path = os.path.join(tmp_path, "test_a2a.json")
+    store = server._FileStore(data_path)
+    store.set_agent("atomic-test", {"name": "atomic"})
+    
+    # Verify the tmp file was cleaned up
+    tmp_path_f = data_path + ".tmp"
+    assert not os.path.isfile(tmp_path_f), f"Temp file should be removed: {tmp_path_f}"
+    
+    # Verify the data was written correctly
+    assert os.path.isfile(data_path)
+    with open(data_path) as f:
+        data = json.load(f)
+    assert data["agents"]["atomic-test"]["name"] == "atomic"
+
+
 # ─── Edge Cases ──────────────────────────────────────────
 
 def test_unknown_tool():
@@ -154,7 +222,6 @@ def test_unknown_tool():
 def test_tool_error_handling():
     """Calling a tool with wrong params should not crash."""
     import asyncio
-    # mcp_validate_config expects a string, pass int instead
     result = asyncio.run(registry.call("mcp_validate_config", {}))
     assert result[0].text is not None
 
